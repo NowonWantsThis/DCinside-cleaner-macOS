@@ -1,0 +1,57 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+credentials.*
+secrets.*
+dcinside-cleaner-login.json
+dcinside_cleaner_proxy_list.json
+dcinside-cleaner-proxy-list.json
+proxy-list*.json
+proxy_list*.json
+proxy*.txt
+proxies*.txt
+*cookie*.json
+*session*.json
+
+# Build and QA output
+build/
+dist/
+release/
+ui-qa/
+tests/
+test-results/
+scripts/
+tools/
+*.app/
+*.dmg
+*.zip
+*.log
+
+# Local editor and agent state
+.idea/
+.vscode/
+.codex/

@@ -1,0 +1,6 @@
+tqdm
+requests
+urllib3<2
+bs4
+pyqt5
+2captcha-python
