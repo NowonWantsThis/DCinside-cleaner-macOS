@@ -40,6 +40,16 @@ a = Analysis(
     optimize=0,
 )
 
+# Installation records can contain the builder's local paths. Runtime package
+# metadata (version, license, entry points) remains available without them.
+a.datas = [
+    entry for entry in a.datas
+    if not (
+        '.dist-info/' in entry[0].replace('\\', '/')
+        and Path(entry[0]).name in {'RECORD', 'direct_url.json'}
+    )
+]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

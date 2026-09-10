@@ -123,12 +123,15 @@ class MainWindow(QtWidgets.QMainWindow, main_form):
         self.current_delay = 0
         self.recent_delays = deque(maxlen=30)
         self.current_task_type = None
+        self.deleted_count = 0
+        self.skipped_count = 0
 
         self.cleaner_thread = CleanerThread(self.captcha_signal)
         self.cleaner = Cleaner()
         self.cleaner_thread.setCleaner(self.cleaner)
 
         self.cleaner_thread.event_signal.connect(self.deleteEvent)
+        self.cleaner_thread.finished.connect(self.deleteFinished)
 
         self.input_pw.returnPressed.connect(self.login)
         self.btn_login.clicked.connect(self.login)
@@ -369,20 +372,30 @@ class MainWindow(QtWidgets.QMainWindow, main_form):
             self.setProgress('삭제 중', 0, event['data'])
             self.current_task_type = None
 
-        elif event['type'] in ('page_update', 'post_update'):
+        elif event['type'] in ('page_update', 'post_update', 'post_skipped'):
+            if event['type'] == 'post_update':
+                self.deleted_count += 1
+            elif event['type'] == 'post_skipped':
+                self.skipped_count += 1
             self.advanceProgress()
 
-            if self.current_task_type != event['type']:
+            task_type = 'page_update' if event['type'] == 'page_update' else 'post_update'
+            if self.current_task_type != task_type:
                 self.recent_delays.clear()
-                self.current_task_type = event['type']
+                self.current_task_type = task_type
 
             if 'captcha_solved' in event['data'].keys() and event['data']['captcha_solved']:
                 self.log(f"캡차가 자동 해제됨")
 
             if event['type'] == 'page_update':
                 self.log(f"{event['data']['index'] + 1}번째 페이지 로딩...")
+            elif event['type'] == 'post_skipped':
+                self.log(f"{event['data']['post_no']}번 항목 건너뜀: {event['data']['message']}")
             else:
                 self.log(f"{event['data']['del_no']}번 글 삭제")
+
+            if task_type == 'post_update' and self.skipped_count:
+                self.label_progress_status.setText(f'삭제 {self.deleted_count} · 건너뜀 {self.skipped_count}')
             
             current_event_delay = event['data']['delay']
             self.recent_delays.append(current_event_delay)
@@ -396,15 +409,30 @@ class MainWindow(QtWidgets.QMainWindow, main_form):
 
             estimated_time_str = self.calculateEstimatedTime(average_delay)
                 
-            self.log(f"프록시: {event['data']['proxy'] or 'X'}, 딜레이: {current_event_delay:.1f}sec, ETA: {estimated_time_str}")
+            if event['type'] == 'post_skipped':
+                self.log(f"딜레이: {current_event_delay:.1f}sec, ETA: {estimated_time_str}")
+            else:
+                self.log(f"프록시: {event['data']['proxy'] or 'X'}, 딜레이: {current_event_delay:.1f}sec, ETA: {estimated_time_str}")
 
         elif event['type'] == 'ipblocked':
+            self.setProgress('삭제 중단', self.progress_cur, self.progress_max)
             self.log('IP 차단 감지')
-            QtWidgets.QMessageBox.warning(self, '차단 안내', 'IP가 차단되었습니다.')
+            QtWidgets.QMessageBox.warning(self, '차단 안내', event.get('message') or 'IP가 차단되었습니다.')
 
         elif event['type'] == 'fail':
-            self.log('삭제 실패')
-            QtWidgets.QMessageBox.warning(self, '실패 안내', '삭제에 실패했습니다.\n잠시 후 다시 시도해 보세요.')
+            self.setProgress('삭제 중단', self.progress_cur, self.progress_max)
+            message = event.get('message') or '삭제에 실패했습니다.\n잠시 후 다시 시도해 보세요.'
+            self.log(f'삭제 실패: {message}')
+            QtWidgets.QMessageBox.warning(self, '실패 안내', message)
+
+        elif event['type'] == 'cancelled':
+            self.setProgress('삭제 취소', self.progress_cur, self.progress_max)
+            self.log(event.get('message') or '삭제를 취소했습니다.')
+
+        elif event['type'] == 'confirmation':
+            confirmed = self.askDeleteConfirmation(
+                event['message'], f"{event['post_no']}번 글의 삭제를 계속하시겠습니까?")
+            self.cleaner_thread.setDeleteConfirmation(confirmed)
 
         elif event['type'] == 'captcha':
             self.log('캡차 감지')
@@ -413,18 +441,49 @@ class MainWindow(QtWidgets.QMainWindow, main_form):
             self.captcha_signal.emit(True)
 
         elif event['type'] == 'complete':
+            summary = event.get('data', {})
+            self.deleted_count = summary.get('deleted_count', self.deleted_count)
+            self.skipped_count = summary.get('skipped_count', self.skipped_count)
             self.completeProgress()
-            self.log('삭제 완료')
-            QtWidgets.QMessageBox.information(self, '완료', '삭제 작업이 완료되었습니다.')
-            self.label_current_mode.setText('모드: 선택 전')
-            self.group_box_gall.setEnabled(True)
-            self.btn_start.setEnabled(True)
-            self.setProxyControlsBusy(False)
-            self.combo_box_gall.clear()
-            self.cleaner_thread.quit()
-            self.g_list = []
-            self.p_type = ''
-            self.updateUserInfo()
+            if self.skipped_count:
+                self.label_progress_status.setText(f'완료 · 삭제 {self.deleted_count} · 건너뜀 {self.skipped_count}')
+                self.log(f'처리 완료: 삭제 {self.deleted_count}개, 건너뜀 {self.skipped_count}개')
+                QtWidgets.QMessageBox.information(
+                    self, '완료', f'처리가 완료되었습니다.\n삭제: {self.deleted_count}개\n건너뜀: {self.skipped_count}개')
+            else:
+                self.log('삭제 완료')
+                QtWidgets.QMessageBox.information(self, '완료', '삭제 작업이 완료되었습니다.')
+
+    @QtCore.pyqtSlot()
+    def deleteFinished(self):
+        self.label_current_mode.setText('모드: 선택 전')
+        self.group_box_gall.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        self.setProxyControlsBusy(False)
+        self.combo_box_gall.clear()
+        self.g_list = []
+        self.p_type = ''
+        self.updateUserInfo()
+
+    def askDeleteConfirmation(self, message, detail, button_text='삭제'):
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle('작성글 삭제 확인')
+        dialog.setIcon(QtWidgets.QMessageBox.Warning)
+        dialog.setTextFormat(QtCore.Qt.PlainText)
+        dialog.setText(message)
+        dialog.setInformativeText(detail)
+        dialog.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+        for label in dialog.findChildren(QtWidgets.QLabel):
+            label.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+            label.setFocusPolicy(QtCore.Qt.NoFocus)
+            label.setCursor(QtCore.Qt.ArrowCursor)
+        dialog.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel)
+        dialog.button(QtWidgets.QMessageBox.Yes).setText(button_text)
+        dialog.button(QtWidgets.QMessageBox.Cancel).setText('취소')
+        dialog.setDefaultButton(QtWidgets.QMessageBox.Cancel)
+        dialog.setEscapeButton(QtWidgets.QMessageBox.Cancel)
+        dialog.button(QtWidgets.QMessageBox.Cancel).setFocus(QtCore.Qt.OtherFocusReason)
+        return dialog.exec_() == QtWidgets.QMessageBox.Yes
 
     def log(self, text):
         self.box_log.append(text)
@@ -499,13 +558,24 @@ class MainWindow(QtWidgets.QMainWindow, main_form):
             idx = self.combo_box_gall.currentIndex()
             del_list = [self.g_list[idx]]
 
-        self.cleaner_thread.setDelInfo(del_list, self.p_type, del_all)
+        posting_consent = False
+        if self.p_type == 'posting':
+            posting_consent = self.askDeleteConfirmation(
+                "일부 갤러리에서 '질문' 등 삭제가 제한된 말머리의 글을 삭제하면 매니저에 의해 차단될 수 있습니다.",
+                '동의하면 이번 작성글 삭제 작업에서 사이트가 요청하는 추가 확인에 자동으로 동의하고 삭제를 계속합니다.\n이 동의는 이번 작업에만 적용됩니다.',
+                button_text='동의하고 삭제')
+            if not posting_consent:
+                return
+
+        self.cleaner_thread.setDelInfo(del_list, self.p_type, del_all, posting_consent=posting_consent)
         
         if self.checkbox_proxy.isChecked():
             self.cleaner.setProxyList(self.proxy_list)
         else:
             self.cleaner.setProxyList([])
 
+        self.deleted_count = 0
+        self.skipped_count = 0
         self.setProgress('준비 중', 0, 0)
         self.group_box_gall.setEnabled(False)
         self.btn_start.setEnabled(False)

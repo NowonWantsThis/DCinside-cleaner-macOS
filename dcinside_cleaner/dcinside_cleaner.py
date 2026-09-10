@@ -55,11 +55,11 @@ class Cleaner:
         self.delay = round(MAX_DELAY / (len(self.proxy_list) or 1), 1)
 
     def _handleProxyError(func):
-        def wrapper(self, *args):
+        def wrapper(self, *args, **kwargs):
             result = None
             while True:
                 try:
-                    result = func(self, *args)
+                    result = func(self, *args, **kwargs)
                 except (ProxyError, ConnectTimeout):
                     self.proxy_list.pop()
                     self.updateDelay()
@@ -168,7 +168,8 @@ class Cleaner:
         }
 
     @_handleProxyError
-    def deletePost(self, post_no: str, post_type: str, solve_captcha: bool) -> Union[dict, bool]:
+    def deletePost(self, post_no: str, post_type: str, solve_captcha: bool,
+                   confirm_delete: bool = False) -> dict:
         gallog_url = f'https://gallog.dcinside.com/{self.user_id}/{post_type}'
 
         proxy = self.getProxy()
@@ -176,50 +177,58 @@ class Cleaner:
         self.session.headers.update({'User-Agent': self.user_agent})
         res = self.session.get(gallog_url, proxies=proxy)
 
-        if not BeautifulSoup(res.text, 'html.parser').select_one('body'):
-            return False
+        if res.status_code != 200 or not BeautifulSoup(res.text, 'html.parser').select_one('body'):
+            return {'result': 'fail', 'msg': '갤로그 페이지를 불러오지 못했습니다. 로그인 상태와 연결을 확인해 주세요.'}
         
         captcha = { 'g-recaptcha-response': self.solveCaptcha(gallog_url) if solve_captcha else 'undefined' }
 
+        csrf_token = self.session.cookies.get_dict().get('ci_c')
+        if not csrf_token:
+            return {'result': 'fail', 'msg': '로그인 확인 정보가 없습니다. 다시 로그인해 주세요.'}
+
         form_data = {
-            'ci_t': self.session.cookies.get_dict()['ci_c'],
+            'ci_t': csrf_token,
             'no': post_no,
             'service_code': 'undefined',
             **(captcha if solve_captcha else {})
         }
+        if post_type == 'posting':
+            form_data['c_k_v'] = 'dzk'
+        if confirm_delete:
+            form_data['del_limit_ok'] = '1'
 
-        self.delete_headers['Referer'] = self.user_id
-        self.session.headers.update(self.delete_headers)
+        headers = {**self.delete_headers, 'Referer': gallog_url}
 
-        data = None
-        for attempt in range(MAX_ATTEMPT):
-            try:
-                res = self.session.post(
-                    f'https://gallog.dcinside.com/{self.user_id}/ajax/log_list_ajax/delete', data=form_data, proxies=proxy)
-                data = res.json()
-                break 
-            except requests.exceptions.JSONDecodeError as e:
-                if attempt < MAX_ATTEMPT - 1:
-                    time.sleep(10)
-                else:
-                    return 'FAILED'
+        res = self.session.post(
+            f'https://gallog.dcinside.com/{self.user_id}/ajax/log_list_ajax/delete',
+            data=form_data, proxies=proxy, headers=headers)
+        if res.status_code != 200:
+            return {'result': 'fail', 'msg': f'삭제 요청에 HTTP {res.status_code} 오류가 발생했습니다. 삭제 여부를 확인해 주세요.'}
 
-        if data is None:
-            return 'FAILED'
+        try:
+            data = res.json()
+        except ValueError:
+            # An unrecognized response does not prove that deletion succeeded.
+            return {'result': 'fail', 'msg': '삭제 결과를 확인할 수 없는 응답입니다. 갤로그에서 삭제 여부를 확인해 주세요.'}
 
-        if res.status_code == 200 and data['result'] == 'success':
+        if not isinstance(data, dict) or not isinstance(data.get('result'), str):
+            return {'result': 'fail', 'msg': '삭제 결과 형식을 확인할 수 없습니다. 갤로그에서 삭제 여부를 확인해 주세요.'}
+        if data['result'] == 'success':
             return {}
         return data
 
-    def deletePosts(self, post_type: str) -> Union[str, list]:
+    def deletePosts(self, post_type: str, confirm_deletion=None):
         solve_captcha = False
+        confirm_delete = False
+        captcha_attempts = 0
 
         while self.post_list:
             post_no = self.post_list[0]
 
             a = time.time()
             time.sleep(self.delay)
-            data = self.deletePost(post_no, post_type, solve_captcha)
+            data = self.deletePost(post_no, post_type, solve_captcha,
+                                   confirm_delete=confirm_delete)
             delay = time.time() - a
 
             if data == 'BLOCKED':
@@ -227,26 +236,67 @@ class Cleaner:
                     'status': False,
                     'data': 'ipblocked'
                 }
+                return
 
-            if data == 'FAILED':
-                yield {
-                    'status': False,
-                    'data': 'failed'
-                }
+            result = data.get('result', '') if isinstance(data, dict) else ''
+            message = data.get('msg', '') if isinstance(data, dict) else ''
+            result = result if isinstance(result, str) else ''
+            message = message if isinstance(message, str) else ''
 
-            if data and ('captcha' in data['result'] or ('fail' in data['result'] and 'g-recaptcha error!' in data['msg'])):
-                if self.twocaptcha_key: 
+            if self.isMissingPostResponse(data):
+                # A queued item may have been removed manually during CAPTCHA.
+                # Consume only this stale number, without emitting delete success.
+                self.post_list.pop(0)
+                solve_captcha = False
+                confirm_delete = False
+                captcha_attempts = 0
+                yield {'status': False, 'data': 'skipped', 'post_no': post_no,
+                       'message': message, 'delay': round(delay, 1)}
+                continue
+
+            if result == 'confirm':
+                if confirm_delete:
+                    yield {'status': False, 'data': 'failed', 'post_no': post_no,
+                           'message': message or '추가 확인 후에도 사이트가 삭제를 승인하지 않았습니다.'}
+                    return
+                if confirm_deletion is None:
+                    yield {'status': False, 'data': 'failed', 'post_no': post_no,
+                           'message': message or '사이트에서 삭제 전 추가 확인을 요구했습니다.'}
+                    return
+                if not confirm_deletion(message or '사이트에서 이 글의 삭제 전 추가 확인을 요구했습니다. 계속하시겠습니까?', post_no):
+                    yield {'status': False, 'data': 'cancelled', 'post_no': post_no,
+                           'message': '추가 삭제 확인을 취소하여 작업을 중단했습니다.'}
+                    return
+                confirm_delete = True
+                continue
+
+            if 'captcha' in result or ('fail' in result and 'g-recaptcha error!' in message):
+                captcha_attempts += 1
+                if self.twocaptcha_key and captcha_attempts < MAX_ATTEMPT:
                     solve_captcha = True
                     continue
+                if self.twocaptcha_key:
+                    yield {'status': False, 'data': 'failed', 'post_no': post_no,
+                           'message': '캡차 인증이 반복해서 실패했습니다. 갤로그에서 인증 상태를 확인해 주세요.'}
+                    return
 
                 yield {
                     'status': False,
                     'data': 'captcha'
                 }
+                continue
+
+            # Only deletePost's explicit success sentinel may consume an item.
+            if not isinstance(data, dict) or data != {}:
+                yield {'status': False, 'data': 'failed', 'post_no': post_no,
+                       'message': message or '사이트에서 삭제 성공을 확인하지 못했습니다. 남은 항목은 유지됩니다.'}
+                return
 
             captcha_solved = solve_captcha
 
             solve_captcha = False
+            confirm_delete = False
+            captcha_attempts = 0
             self.post_list.pop(0)
 
             yield {
@@ -258,6 +308,16 @@ class Cleaner:
                     'captcha_solved': captcha_solved
                 }
             }
+
+    @staticmethod
+    def isMissingPostResponse(data) -> bool:
+        if not isinstance(data, dict) or data.get('result') not in ('fail', 'error'):
+            return False
+        message = data.get('msg')
+        if not isinstance(message, str):
+            return False
+        normalized = ''.join(message.split()).rstrip('.!。')
+        return normalized in ('올바르지않은번호', '올바르지않은번호입니다')
 
     @_handleProxyError
     def getPageCount(self, gno: str, post_type: str) -> int:
@@ -319,6 +379,7 @@ class Cleaner:
                     'status': False,
                     'data': 'ipblocked'
                 }
+                return
 
             self.post_list += res
 

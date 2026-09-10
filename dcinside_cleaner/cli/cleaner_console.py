@@ -10,6 +10,9 @@ class Console:
         self.cleaner = Cleaner()
         self.login_flag = False
         self.g_list = {'type':  None}
+        self.posting_consent = False
+        self.deleted_count = 0
+        self.skipped_count = 0
         self.getCommand()
         self.articles = 0
 
@@ -87,6 +90,9 @@ class Console:
                 idx += 1
 
         elif cmd[0] == 'del':
+            self.posting_consent = False
+            self.deleted_count = 0
+            self.skipped_count = 0
             if self.g_list['type'] == None:
                 print('갤러리 리스트를 선택하지 않았습니다.')
             del_list = []
@@ -106,28 +112,58 @@ class Console:
                 if del_no.isdigit():
                     gno = self.g_list[int(del_no)]
                     post_type = self.g_list['type']
-                    self.delete(gno, post_type)
+                    if self.delete(gno, post_type) is False:
+                        if self.skipped_count:
+                            print(f'처리 중단: 삭제 {self.deleted_count}개, 건너뜀 {self.skipped_count}개')
+                        return
+            if self.skipped_count:
+                print(f'처리 완료: 삭제 {self.deleted_count}개, 건너뜀 {self.skipped_count}개')
 
         elif cmd[0] == 'logout':
             self.login_flag = False
             self.user_id, self.user_pw = ''
 
     
+    def confirmDeletion(self, message, post_no):
+        if self.posting_consent:
+            return True
+        print(message)
+        print('동의하면 이번 삭제 작업에서 사이트가 요청하는 추가 확인에 자동으로 동의합니다.')
+        self.posting_consent = input(f'{post_no}번 글부터 삭제를 계속하시겠습니까? [y/N] >> ').strip().lower() in ('y', 'yes', '예')
+        return self.posting_consent
+
     def delete(self, gno, post_type):
         print('글 목록 가져오는 중...')
         with tqdm(total=self.cleaner.getPageCount(gno, post_type)) as pbar:
             for i in self.cleaner.aggregatePosts(gno, post_type):
-                if i == 'ipblocked': return print('IP 차단이 감지되었습니다.')
+                if i['status'] is not True:
+                    message = 'IP 차단이 감지되었습니다.' if i['data'] == 'ipblocked' else '글 목록을 가져오지 못했습니다.'
+                    print(i.get('message') or message)
+                    return False
                 pbar.update(1)
 
         print('글 지우는 중...')
         with tqdm(total=len(self.cleaner.post_list)) as pbar:
-            for i in self.cleaner.deletePosts(post_type):
-                if i == 'ipblocked': return print('IP 차단이 감지되었습니다.')
-                if i == 'captcha':
-                    print('reCAPTCHA Detected!')
-                    input('캡차를 해제한 후 엔터키를 눌러주십시오.')
+            for i in self.cleaner.deletePosts(post_type, confirm_deletion=self.confirmDeletion):
+                if i['status'] is not True:
+                    if i['data'] == 'skipped':
+                        self.skipped_count += 1
+                        print(f"{i['post_no']}번 항목 건너뜀: {i.get('message') or '이미 삭제되었거나 목록에 없는 항목입니다.'}")
+                        pbar.update(1)
+                        continue
+                    if i['data'] == 'captcha':
+                        print('reCAPTCHA Detected!')
+                        input('캡차를 해제한 후 엔터키를 눌러주십시오.')
+                        continue
+                    message = {
+                        'ipblocked': 'IP 차단이 감지되었습니다.',
+                        'cancelled': '삭제를 취소했습니다.',
+                    }.get(i['data'], '삭제에 실패했습니다.')
+                    print(i.get('message') or message)
+                    return False
+                self.deleted_count += 1
                 pbar.update(1)
+        return True
 
     def getCommand(self):
         print('dcinside cleaner')

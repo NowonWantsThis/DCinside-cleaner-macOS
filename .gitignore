@@ -42,7 +42,6 @@ build/
 dist/
 release/
 ui-qa/
-tests/
 test-results/
 scripts/
 tools/
@@ -50,8 +49,15 @@ tools/
 *.dmg
 *.zip
 *.log
+*.har
+*.sqlite
+*.sqlite3
+*.db
+work/
+outputs/
 
 # Local editor and agent state
 .idea/
 .vscode/
 .codex/
+.agents/
